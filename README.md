@@ -1,7 +1,7 @@
 > [!IMPORTANT]
 > **首次打开提示：** DogSC 目前通过 GitHub 分发，暂不计划在 App Store 付费上架。当前测试版使用 Apple Development 开发签名，尚未采用 Developer ID 分发签名并完成 Apple 公证。
 >
-> 下载 DMG 并将 DogSC 拖入「应用程序」后，如果 macOS 阻止打开，可在 **系统设置 → 隐私与安全性 → 仍要打开** 中允许。请确认文件来自本仓库的 [Releases](https://github.com/laogou717/dogsc/releases)，无需关闭系统安全保护。详见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
+> 下载 DMG 并将 DogSC 拖入「应用程序」后，如果 macOS 阻止打开，可在 **系统设置 → 隐私与安全性 → 仍要打开** 中允许。请确认文件来自上游官方仓库的 [Releases](https://github.com/laogou717/dogsc/releases)，无需关闭系统安全保护。详见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
 >
 > App Store 上架与签名、公证是不同的流程；App Store 之外的应用也可以使用 [Developer ID](https://developer.apple.com/developer-id/) 分发。
 
