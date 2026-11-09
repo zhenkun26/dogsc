@@ -54,7 +54,7 @@ final class CaptureAreaSelector {
         window.isReleasedWhenClosed = false
         view.autoresizingMask = [.width, .height]
         window.contentView = view
-        window.appearance = NSAppearance(named: .aqua)
+        window.appearance = nil
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
@@ -122,7 +122,6 @@ final class CaptureAreaSelector {
         transition.settlePresentation([window])
         window.level = CaptureWindowLevelPolicy.level(for: .recordingGuideOverlay)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        window.sharingType = .none
         _ = view.beginRecordingHighlight()
         hideRecordingOverlay()
         recordingOverlayWindow = window
@@ -167,7 +166,7 @@ final class CaptureAreaSelector {
         window.hidesOnDeactivate = false
         window.level = CaptureWindowLevelPolicy.level(for: .recordingGuideOverlay)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        window.sharingType = .none
+        window.sharingType = .readOnly
         window.orderFrontRegardless()
         recordingOverlayWindow = window
     }
@@ -334,11 +333,14 @@ private final class CaptureAreaSelectionView: NSView {
     }
 
     private let controlCard = NSView()
+    private let presetSelection = AreaPresetSelectionView()
     private let escapeHintCard = NSView()
     private let escapeHintContent = EscapeHintContentView()
     private let controlDividers = (0..<3).map { _ in NSView() }
-    private let widthCaption = NSTextField(labelWithString: "宽")
-    private let heightCaption = NSTextField(labelWithString: "高")
+    private let widthCaption = NSTextField(labelWithString: appLocalized("宽"))
+    private let heightCaption = NSTextField(labelWithString: appLocalized("高"))
+    /// Width and height read as one value inside a single pill.
+    private let sizeWell = NSView()
     private let widthField = VerticallyCenteredTextField()
     private let heightField = VerticallyCenteredTextField()
     private lazy var dimensionLinkButton = AreaDimensionLinkButton(
@@ -385,9 +387,14 @@ private final class CaptureAreaSelectionView: NSView {
     private var dimensionLinkEnabled = false
     private var dragOperation: DragOperation?
     private var selectionRect: CGRect?
+    private var presentedSelectionRect: CGRect?
+    private var presentedControlCardFrame: CGRect?
+    private let sizeTransition = CaptureAreaSelectionMotion()
+    private var visibleSelectionRect: CGRect? { presentedSelectionRect ?? selectionRect }
     private var acceptsSelectionInput = true
     private var recordingHighlight = false
     private let controlCardTransition = CaptureSelectionCardTransition()
+    private var languageBinding: AppLanguageBinding?
 
     var hasValidSelection: Bool {
         selectionRect.map { $0.width >= 24 && $0.height >= 24 } ?? false
@@ -413,24 +420,49 @@ private final class CaptureAreaSelectionView: NSView {
         configureControls()
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for card in [controlCard, escapeHintCard] {
+                card.layer?.backgroundColor = captureSelectionSurfaceNSColor.cgColor
+                card.layer?.borderColor = captureSelectionInkNSColor.withAlphaComponent(0.12).cgColor
+                card.layer?.shadowOpacity = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? 0.36 : 0.16
+            }
+            sizeWell.layer?.backgroundColor = RecorderStyle.chromeNSColor.withAlphaComponent(0.09).cgColor
+            for divider in controlDividers {
+                divider.layer?.backgroundColor = captureSelectionInkNSColor.withAlphaComponent(0.08).cgColor
+            }
+            for field in [widthField, heightField] {
+                field.layer?.borderColor = captureSelectionInkNSColor.withAlphaComponent(0.08).cgColor
+            }
+            CATransaction.commit()
+        }
+        needsDisplay = true
+    }
+
     private func configureControls() {
         wantsLayer = true
 
         [controlCard, escapeHintCard].forEach { card in
-            card.appearance = NSAppearance(named: .aqua)
+            card.appearance = nil
             card.wantsLayer = true
             card.layer?.cornerRadius = 18
             card.layer?.backgroundColor = captureSelectionSurfaceNSColor.cgColor
             card.layer?.borderWidth = 1
-            card.layer?.borderColor = captureSelectionInkNSColor.withAlphaComponent(0.08).cgColor
+            card.layer?.borderColor = captureSelectionInkNSColor.withAlphaComponent(0.12).cgColor
             card.layer?.shadowColor = NSColor.black.cgColor
-            card.layer?.shadowOpacity = 0.12
-            card.layer?.shadowRadius = 18
-            card.layer?.shadowOffset = CGSize(width: 0, height: -6)
+            card.layer?.shadowOpacity = 0.36
+            card.layer?.shadowRadius = 26
+            card.layer?.shadowOffset = CGSize(width: 0, height: -12)
             addSubview(card)
         }
-        escapeHintCard.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.64).cgColor
-        escapeHintCard.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        sizeWell.wantsLayer = true
+        sizeWell.layer?.backgroundColor = RecorderStyle.chromeNSColor.withAlphaComponent(0.09).cgColor
+        sizeWell.layer?.cornerCurve = .continuous
+        controlCard.addSubview(sizeWell)
+        controlCard.addSubview(presetSelection)
 
         // The first screen is only the dimmed desktop and its central hint.
         // The toolbar becomes available after the user draws a valid region.
@@ -458,9 +490,9 @@ private final class CaptureAreaSelectionView: NSView {
             field.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
             field.alignment = .center
             field.textColor = captureSelectionInkNSColor
-            field.backgroundColor = NSColor(calibratedWhite: 0.945, alpha: 1)
+            field.backgroundColor = .clear
             field.isBezeled = false
-            field.drawsBackground = true
+            field.drawsBackground = false
             field.wantsLayer = true
             field.layer?.cornerRadius = 8
             field.layer?.borderWidth = 1
@@ -470,21 +502,46 @@ private final class CaptureAreaSelectionView: NSView {
             field.action = #selector(applyManualSize(_:))
             controlCard.addSubview(field)
         }
-        widthField.placeholderString = "宽度"
-        heightField.placeholderString = "高度"
-        widthField.setAccessibilityLabel("录制区域宽度（像素）")
-        heightField.setAccessibilityLabel("录制区域高度（像素）")
+        widthField.placeholderString = appLocalized("宽度")
+        heightField.placeholderString = appLocalized("高度")
+        widthField.setAccessibilityLabel(appLocalized("录制区域宽度（像素）"))
+        heightField.setAccessibilityLabel(appLocalized("录制区域高度（像素）"))
 
         controlCard.addSubview(dimensionLinkButton)
         updateDimensionLink()
 
         confirmButton.keyEquivalent = "\r"
         confirmButton.isEnabled = false
-        cancelButton.setAccessibilityHelp("按 Esc 取消区域选择")
-        confirmButton.setAccessibilityHelp("按 Return 开始录制")
+        cancelButton.setAccessibilityHelp(appLocalized("按 Esc 取消区域选择"))
+        confirmButton.setAccessibilityHelp(appLocalized("按 Return 开始录制"))
         [applySizeButton, cancelButton, confirmButton].forEach(controlCard.addSubview)
 
         configureEscapeHint()
+        languageBinding = AppLanguageBinding { [weak self] in self?.refreshLanguage() }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screenParametersDidChange(_:)),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+    }
+
+    private func refreshLanguage() {
+        widthCaption.stringValue = appLocalized("宽")
+        heightCaption.stringValue = appLocalized("高")
+        widthField.placeholderString = appLocalized("宽度")
+        heightField.placeholderString = appLocalized("高度")
+        widthField.setAccessibilityLabel(appLocalized("录制区域宽度（像素）"))
+        heightField.setAccessibilityLabel(appLocalized("录制区域高度（像素）"))
+        cancelButton.setAccessibilityHelp(appLocalized("按 Esc 取消区域选择"))
+        confirmButton.setAccessibilityHelp(appLocalized("按 Return 开始录制"))
+        presetButtons.forEach { $0.refreshLanguage() }
+        [applySizeButton, cancelButton, confirmButton].forEach { $0.refreshLanguage() }
+        dimensionLinkButton.refreshLanguage()
+        updateDimensionLink()
+        escapeHintContent.refreshLanguage()
+        // Refit the hint text only; never rewrite the user's dimension fields
+        // or selection identity as part of a language change.
+        needsLayout = true
+        needsDisplay = true
     }
 
     private func configureEscapeHint() {
@@ -492,6 +549,7 @@ private final class CaptureAreaSelectionView: NSView {
     }
 
     func prepareForRetirement() {
+        stopSizeTransition()
         acceptsSelectionInput = false
         onComplete = nil
         onSelectionChanged = nil
@@ -550,95 +608,154 @@ private final class CaptureAreaSelectionView: NSView {
         layoutEscapeHint(scale: interfaceScale)
     }
 
-    /// The toolbar exists only for a valid, settled region. Its geometry is
-    /// anchored directly to that region; showing it never animates a journey
-    /// from an unrelated position on the screen.
+    @objc private func screenParametersDidChange(_ notification: Notification) {
+        // A Dock move/resize must not leave a toolbar animation targeting the
+        // old available area. The recording rectangle itself is unchanged.
+        stopSizeTransition()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { stopSizeTransition() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    /// Initial appearance and pointer drags follow the region immediately.
+    /// Explicit size choices interpolate from the currently visible geometry.
     private func layoutControlCard(scale: CGFloat) {
-        guard hasValidSelection, !isCreatingSelection, let selectionRect else {
+        guard hasValidSelection, !isCreatingSelection, let selectionRect = visibleSelectionRect else {
             controlCardTransition.hide(controlCard, animated: false)
             controlCard.isHidden = true
+            refreshControlHover()
             return
         }
 
-        let cardHeight: CGFloat = 76 * scale
-        let cardWidth: CGFloat = 830 * scale
-        let edgeInset: CGFloat = 12 * scale
-        let gap: CGFloat = 16 * scale
-        let below = selectionRect.minY - cardHeight - gap
-        let above = selectionRect.maxY + gap
-        let y: CGFloat
-        if below >= bounds.minY + edgeInset {
-            y = below
-        } else if above + cardHeight <= bounds.maxY - edgeInset {
-            y = above
-        } else {
-            y = min(
-                max(below, bounds.minY + edgeInset),
-                bounds.maxY - cardHeight - edgeInset
-            )
-        }
-        let x = min(
-            max(selectionRect.midX - cardWidth / 2, bounds.minX + edgeInset),
-            bounds.maxX - cardWidth - edgeInset
-        )
-        let target = CGRect(x: x, y: y, width: cardWidth, height: cardHeight)
+        let target = presentedControlCardFrame ?? controlCardFrame(for: selectionRect, scale: scale)
 
-        // The approved reference keeps all groups on one row. Presets retain
-        // the icon-over-caption shape; only Cancel and Start share the large
-        // action surface, with a single centered Chinese title.
-        let presetOrigins: [CGFloat] = [16, 78, 132, 186, 240]
+        // One row on one surface: shapes, size, then the two actions. Nothing
+        // is boxed or ruled off; the groups are told apart by spacing alone.
+        let presetOrigins: [CGFloat] = [12, 60, 108, 156, 204]
         for (button, origin) in zip(presetButtons, presetOrigins) {
             button.frame = CGRect(
                 x: origin * scale,
-                y: 8 * scale,
-                width: 54 * scale,
-                height: 60 * scale
+                y: 14 * scale,
+                width: 46 * scale,
+                height: 32 * scale
             )
             button.updateScale(scale)
         }
-        for (divider, origin) in zip(controlDividers, [CGFloat(302), 506, 598]) {
-            divider.frame = CGRect(x: origin * scale, y: 14 * scale, width: 1 * scale, height: 48 * scale)
-        }
-        widthCaption.frame = CGRect(x: 318 * scale, y: 49 * scale, width: 66 * scale, height: 15 * scale)
-        widthField.frame = CGRect(x: 318 * scale, y: 13 * scale, width: 66 * scale, height: 32 * scale)
-        dimensionLinkButton.frame = CGRect(x: 393 * scale, y: 13 * scale, width: 26 * scale, height: 32 * scale)
-        heightCaption.frame = CGRect(x: 425 * scale, y: 49 * scale, width: 66 * scale, height: 15 * scale)
-        heightField.frame = CGRect(x: 425 * scale, y: 13 * scale, width: 66 * scale, height: 32 * scale)
-        applySizeButton.frame = CGRect(x: 518 * scale, y: 13 * scale, width: 68 * scale, height: 50 * scale)
-        cancelButton.frame = CGRect(x: 616 * scale, y: 13 * scale, width: 72 * scale, height: 50 * scale)
-        confirmButton.frame = CGRect(x: 696 * scale, y: 13 * scale, width: 120 * scale, height: 50 * scale)
+        presetSelection.frame = CGRect(origin: .zero, size: target.size)
+        presetSelection.move(to: presetButtons[selectedPreset.rawValue].frame,
+                             animated: !controlCard.isHidden)
+        controlDividers.forEach { $0.isHidden = true }
+        [widthCaption, heightCaption].forEach { $0.isHidden = true }
+        // Typing a size and pressing Return applies it; no button is needed.
+        applySizeButton.isHidden = true
+        sizeWell.frame = CGRect(x: 262 * scale, y: 14 * scale, width: 172 * scale, height: 32 * scale)
+        sizeWell.layer?.cornerRadius = 16 * scale
+        widthField.frame = CGRect(x: 270 * scale, y: 14 * scale, width: 60 * scale, height: 28 * scale)
+        dimensionLinkButton.frame = CGRect(x: 334 * scale, y: 16 * scale, width: 28 * scale, height: 28 * scale)
+        heightField.frame = CGRect(x: 366 * scale, y: 14 * scale, width: 60 * scale, height: 28 * scale)
+        cancelButton.frame = CGRect(x: 444 * scale, y: 8 * scale, width: 62 * scale, height: 44 * scale)
+        confirmButton.frame = CGRect(x: 510 * scale, y: 8 * scale, width: 124 * scale, height: 44 * scale)
 
-        controlCard.layer?.cornerRadius = 18 * scale
+        controlCard.layer?.cornerRadius = 30 * scale
+        controlCard.layer?.cornerCurve = .continuous
         controlCard.layer?.borderWidth = scale
-        controlCard.layer?.shadowRadius = 18 * scale
-        controlCard.layer?.shadowOffset = CGSize(width: 0, height: -6 * scale)
+        controlCard.layer?.shadowRadius = 22 * scale
+        controlCard.layer?.shadowOffset = CGSize(width: 0, height: -10 * scale)
         widthCaption.font = .systemFont(ofSize: 11.5 * scale, weight: .medium)
         heightCaption.font = .systemFont(ofSize: 11.5 * scale, weight: .medium)
         widthField.font = .monospacedDigitSystemFont(ofSize: 14 * scale, weight: .semibold)
         heightField.font = .monospacedDigitSystemFont(ofSize: 14 * scale, weight: .semibold)
         widthField.layer?.cornerRadius = 8 * scale
         heightField.layer?.cornerRadius = 8 * scale
-        widthField.layer?.borderWidth = scale
-        heightField.layer?.borderWidth = scale
+        widthField.layer?.borderWidth = 0
+        heightField.layer?.borderWidth = 0
         [applySizeButton, cancelButton, confirmButton].forEach {
             $0.updateScale(scale)
         }
         dimensionLinkButton.updateScale(scale)
         controlCardTransition.show(controlCard, at: target)
+        refreshControlHover()
         window?.invalidateCursorRects(for: self)
     }
 
+    private func controlCardFrame(for rect: CGRect, scale: CGFloat) -> CGRect {
+        CaptureAreaSelectionLayout.toolbarFrame(
+            for: rect, in: controlsAvailableBounds, scale: scale
+        )
+    }
+
+    private func refreshControlHover() {
+        for case let button as CaptureSelectionNativeButton in controlCard.subviews {
+            button.refreshCapturePointerState()
+        }
+    }
+
+    private func stopSizeTransition(adoptingVisibleSelection: Bool = false) {
+        sizeTransition.stop()
+        if adoptingVisibleSelection, let presentedSelectionRect {
+            selectionRect = presentedSelectionRect.integral
+        }
+        presentedSelectionRect = nil
+        presentedControlCardFrame = nil
+        needsLayout = true
+        needsDisplay = true
+    }
+
+    private func transitionSelection(to target: CGRect, updateFields: Bool = true) {
+        let start = visibleSelectionRect
+        let cardStart = controlCard.frame
+        stopSizeTransition()
+        // The confirmed model always contains the final region. Intermediate
+        // animation frames must never become the recorded crop on Return.
+        selectionRect = target
+        updateSelectionUI(updateFields: updateFields)
+        guard let start, start != target, !controlCard.isHidden,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+              let window else {
+            layoutSubtreeIfNeeded()
+            return
+        }
+        let cardTarget = controlCardFrame(for: target, scale: controlCardScale)
+        sizeTransition.start(in: window) { [weak self] progress in
+            guard let self else { return }
+            func interpolate(_ from: CGRect, _ to: CGRect) -> CGRect {
+                CGRect(x: from.minX + (to.minX - from.minX) * progress,
+                       y: from.minY + (to.minY - from.minY) * progress,
+                       width: from.width + (to.width - from.width) * progress,
+                       height: from.height + (to.height - from.height) * progress)
+            }
+            self.presentedSelectionRect = progress < 1 ? interpolate(start, target) : nil
+            self.presentedControlCardFrame = progress < 1 ? interpolate(cardStart, cardTarget) : nil
+            self.needsLayout = true
+            self.needsDisplay = true
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+
     private func layoutEscapeHint(scale: CGFloat) {
-        escapeHintCard.isHidden = selectionRect != nil || dragOperation != nil
+        let ready = hasValidSelection && dragOperation == nil
+        escapeHintContent.showsStartShortcut = ready
+        escapeHintCard.isHidden = dragOperation != nil
         let escapeHintWidth = escapeHintContent.preferredWidth(for: scale)
-        let hintHeight: CGFloat = 88 * scale
-        escapeHintCard.frame = CGRect(
-            x: bounds.midX - escapeHintWidth / 2,
-            y: bounds.midY - hintHeight / 2,
-            width: escapeHintWidth,
+        let hintHeight: CGFloat = 44 * scale
+        let available = controlsAvailableBounds
+        var hintFrame = CGRect(
+            x: available.midX - min(escapeHintWidth, available.width) / 2,
+            y: available.midY - hintHeight / 2,
+            width: min(escapeHintWidth, available.width),
             height: hintHeight
         )
-        escapeHintCard.layer?.cornerRadius = 16 * scale
+        if ready, !controlCard.isHidden,
+           hintFrame.intersects(controlCard.frame.insetBy(dx: -12 * scale, dy: -12 * scale)) {
+            // Keep the keyboard hint off the toolbar's native hit targets.
+            hintFrame.origin.y = available.maxY - hintHeight - 12 * scale
+            escapeHintCard.isHidden = hintFrame.intersects(controlCard.frame)
+        }
+        escapeHintCard.frame = hintFrame
+        escapeHintCard.layer?.cornerRadius = hintHeight / 2
+        escapeHintCard.layer?.cornerCurve = .continuous
         escapeHintContent.frame = escapeHintCard.bounds
         escapeHintContent.interfaceScale = scale
     }
@@ -648,6 +765,7 @@ private final class CaptureAreaSelectionView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         guard controlCard.isHidden || !controlCardTransition.visibleFrame(of: controlCard).contains(point) else { return }
 
+        stopSizeTransition(adoptingVisibleSelection: true)
         window?.makeFirstResponder(self)
 
         if let selectionRect,
@@ -717,6 +835,12 @@ private final class CaptureAreaSelectionView: NSView {
             onComplete?(nil)
         } else if event.keyCode == 36 {
             confirmSelection(nil)
+        } else if event.keyCode == 49, !event.isARepeat,
+                  event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                  window?.firstResponder === self, hasValidSelection, dragOperation == nil {
+            // Only the drawing canvas owns this shortcut. Space in a size
+            // field or a focused native button retains its normal behavior.
+            confirmSelection(nil)
         } else {
             super.keyDown(with: event)
         }
@@ -724,6 +848,10 @@ private final class CaptureAreaSelectionView: NSView {
 
     @objc private func changeAspectPreset(_ sender: AreaPresetButton) {
         guard let preset = AspectPreset(rawValue: sender.tag) else { return }
+        guard preset != selectedPreset else {
+            refreshControlHover()
+            return
+        }
         selectedPreset = preset
         dimensionLinkEnabled = preset.ratio != nil
         updatePresetButtons()
@@ -731,10 +859,13 @@ private final class CaptureAreaSelectionView: NSView {
         if let aspect = preset.ratio {
             // 已有选区时保持其中心只改比例，避免整个选区跳走；
             // 还没有选区时按可用区域中心生成一个。
-            selectionRect = selectionRect.map { existing in
+            let target = selectionRect.map { existing in
                 aspectRect(aspect, preservingCenter: existing)
             } ?? centeredSelectionRect(aspect: aspect)
-            updateSelectionUI()
+            transitionSelection(to: target)
+        } else {
+            needsLayout = true
+            layoutSubtreeIfNeeded()
         }
     }
 
@@ -807,11 +938,11 @@ private final class CaptureAreaSelectionView: NSView {
             x: min(max(preferredCenter.x - size.width / 2, bounds.minX), bounds.maxX - size.width),
             y: min(max(preferredCenter.y - size.height / 2, bounds.minY), bounds.maxY - size.height)
         )
-        selectionRect = CGRect(origin: origin, size: size)
-        updateSelectionUI(updateFields: false)
+        transitionSelection(to: CGRect(origin: origin, size: size), updateFields: false)
     }
 
     @objc private func confirmSelection(_ sender: Any?) {
+        stopSizeTransition()
         guard let rect = selectionRect,
               rect.width >= 24,
               rect.height >= 24,
@@ -951,7 +1082,7 @@ private final class CaptureAreaSelectionView: NSView {
 
     private func updateDimensionLink() {
         dimensionLinkButton.setLinked(dimensionLinkEnabled)
-        dimensionLinkButton.toolTip = dimensionLinkEnabled ? "宽高比例已锁定" : "宽高比例未锁定"
+        dimensionLinkButton.toolTip = appLocalized(dimensionLinkEnabled ? "宽高比例已锁定" : "宽高比例未锁定")
     }
 
     private func updateSelectionUI(updateFields: Bool = true) {
@@ -985,7 +1116,7 @@ private final class CaptureAreaSelectionView: NSView {
         context.setFillColor(NSColor.black.withAlphaComponent(0.25).cgColor)
         context.fill(bounds)
 
-        guard let selectionRect else { return }
+        guard let selectionRect = visibleSelectionRect else { return }
         context.clear(selectionRect)
 
         let scale = interfaceScale
@@ -1018,8 +1149,9 @@ private final class CaptureAreaSelectionView: NSView {
         }
 
         let backingScale = max(window?.backingScaleFactor ?? 1, 1)
-        let sizeText = "\(Int((selectionRect.width * backingScale).rounded())) × "
-            + "\(Int((selectionRect.height * backingScale).rounded()))"
+        let targetRect = self.selectionRect ?? selectionRect
+        let sizeText = "\(Int((targetRect.width * backingScale).rounded())) × "
+            + "\(Int((targetRect.height * backingScale).rounded()))"
         let string = NSAttributedString(
             string: sizeText,
             attributes: [
@@ -1060,7 +1192,18 @@ private final class CaptureAreaSelectionView: NSView {
     // Compact only the toolbar; region geometry and drag handles retain their
     // existing screen scale, independent of the toolbar's visual size.
     private var controlCardScale: CGFloat {
-        min(0.85, interfaceScale)
+        CaptureAreaSelectionLayout.scale(
+            in: controlsAvailableBounds, preferred: min(0.85, interfaceScale)
+        )
+    }
+
+    private var controlsAvailableBounds: CGRect {
+        guard let window, let screen = window.screen else { return bounds }
+        // NSScreen is global bottom-left geometry; convert through the actual
+        // window so secondary/negative-origin screens share the same rule.
+        let local = convert(window.convertFromScreen(screen.visibleFrame), from: nil)
+            .intersection(bounds)
+        return local.isEmpty || local.isNull ? bounds : local
     }
 
     private var interfaceScale: CGFloat {

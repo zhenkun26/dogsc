@@ -14,19 +14,18 @@ final class RecorderMemoStore: ObservableObject {
     @Published var text: String { didSet { scheduleSave() } }
     @Published var fontSize: Double { didSet { scheduleSave() } }
     @Published var opacity: Double { didSet { scheduleSave() } }
-    @Published var isEditing: Bool
+    private let defaults: UserDefaults
     private var pendingSave: Task<Void, Never>?
     private var hasChanges = false
 
-    init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         let savedText = defaults.string(forKey: Key.text) ?? ""
         text = savedText
         let savedSize = defaults.object(forKey: Key.fontSize) as? Double ?? 22
         let savedOpacity = defaults.object(forKey: Key.opacity) as? Double ?? 0.92
         fontSize = savedSize.isFinite ? min(max(savedSize, 16), 40) : 22
         opacity = savedOpacity.isFinite ? min(max(savedOpacity, 0.55), 1) : 0.92
-        isEditing = savedText.isEmpty
     }
 
     private func scheduleSave() {
@@ -43,7 +42,6 @@ final class RecorderMemoStore: ObservableObject {
         pendingSave = nil
         guard hasChanges else { return }
         hasChanges = false
-        let defaults = UserDefaults.standard
         defaults.set(text, forKey: Key.text)
         defaults.set(fontSize, forKey: Key.fontSize)
         defaults.set(opacity, forKey: Key.opacity)
@@ -104,13 +102,12 @@ final class RecorderMemoController: NSObject, ObservableObject, NSWindowDelegate
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-        panel.appearance = NSAppearance(named: .aqua)
-        panel.title = appLocalized("备忘录")
+        panel.appearance = nil
+        appLocalizeWindowTitle(panel, "备忘录")
         panel.identifier = NSUserInterfaceItemIdentifier("recorder.memo.window")
-        // ScreenRecorder's display/area filter excludes our whole PID, including
-        // windows opened mid-recording. Window capture includes only its target.
-        // sharingType is additional protection, not our ScreenCaptureKit filter.
-        panel.sharingType = .none
+        // CaptureSurfaceFilter excludes this process's helper windows, including
+        // memos opened mid-recording. Other recorders may capture the memo.
+        panel.sharingType = .readOnly
         panel.onClose = { [weak self] in self?.hide() }
         panel.onMoveEnded = { [weak self] in
             self?.constrainToScreen()
@@ -118,7 +115,7 @@ final class RecorderMemoController: NSObject, ObservableObject, NSWindowDelegate
         }
         panel.contentViewController = NSHostingController(rootView:
             RecorderMemoView(store: store, onClose: { [weak self] in self?.hide() })
-                .preferredColorScheme(.light).appControlFocusAppearance())
+                .appControlFocusAppearance())
         panel.delegate = self
         self.panel = panel
         screenObserver = NotificationCenter.default.addObserver(
@@ -203,136 +200,99 @@ struct RecorderMemoButton: View {
     @ObservedObject private var memo = RecorderMemoController.shared
     var body: some View {
         ZStack {
-            Image(systemName: "note.text").font(.appUI(size: 17))
-                .foregroundStyle(RecorderStyle.ink)
+            if memo.isVisible {
+                Circle().fill(RecorderStyle.selection).padding(3).transition(.scale(scale: 0.6).combined(with: .opacity))
+            }
+            Image(systemName: memo.isVisible ? "note.text" : "note.text").font(.system(size: 14, weight: .medium))
+                .foregroundStyle(memo.isVisible ? RecorderStyle.ink : RecorderStyle.muted)
                 .frame(width: size, height: size)
-                .modifier(RecorderRaisedSurface(radius: 11, selected: memo.isVisible))
                 .accessibilityHidden(true)
             RecorderActionTrigger(action: WindowCoordinator.toggleRecorderMemo,
                 accessibilityLabel: appLocalized(memo.isVisible ? "收起备忘录" : "打开备忘录"),
-                accessibilityIdentifier: "recorder.memo.toggle", cornerRadius: 11, highlightOpacity: 0.06)
+                accessibilityIdentifier: "recorder.memo.toggle", cornerRadius: size / 2, highlightOpacity: 0.05)
         }
         .frame(width: size, height: size)
+        .animation(RecorderMotion.quick, value: memo.isVisible)
         .help("备忘录")
     }
 }
 
+/// A sheet of notes and nothing else. The few controls it needs are glyphs
+/// along the top edge; the words on it are the user's.
 private struct RecorderMemoView: View {
     @ObservedObject var store: RecorderMemoStore
     let onClose: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                HStack(spacing: 9) {
-                    Image(systemName: "note.text").font(.appUI(size: 17))
-                        .frame(width: 32, height: 32)
-                        .background(RecorderStyle.mintWash, in: RoundedRectangle(cornerRadius: 10))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("备忘录").font(.appUI(size: 15, weight: .semibold))
-                        Text("仅自己可见").font(.appUI(size: 10)).foregroundStyle(RecorderStyle.muted)
-                    }
-                    Spacer(minLength: 0)
+            HStack(spacing: 0) {
+                // The empty stretch of the bar is the handle the sheet moves by.
+                Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay { RecorderMemoWindowHandle(resizes: false) }
+                control("textformat.size.smaller", title: "缩小备忘录字号", enabled: store.fontSize > 16) {
+                    store.fontSize = max(16, store.fontSize - 2)
                 }
-                .overlay { RecorderMemoWindowHandle(resizes: false) }
-                HStack(spacing: 2) {
-                    modeButton(editing: true, title: "编辑")
-                    modeButton(editing: false, title: "阅读")
+                control("textformat.size.larger", title: "放大备忘录字号", enabled: store.fontSize < 40) {
+                    store.fontSize = min(40, store.fontSize + 2)
                 }
-                .padding(3)
-                .background(RecorderStyle.line, in: RoundedRectangle(cornerRadius: 10))
-                .accessibilityIdentifier("recorder.memo.mode")
-                Button(action: onClose) {
-                    Image(systemName: "xmark").font(.appUI(size: 12)).frame(width: 28, height: 28)
-                }
-                .buttonStyle(RecorderCirclePressStyle())
-                .accessibilityLabel("收起备忘录")
+                Slider(value: $store.opacity, in: 0.55...1)
+                    .tint(RecorderStyle.chrome.opacity(0.7)).controlSize(.mini)
+                    .frame(width: 58).padding(.horizontal, 8)
+                    .help("背景不透明度")
+                    .accessibilityLabel("备忘录背景不透明度")
+                control("xmark", title: "收起备忘录", action: onClose)
             }
-            .padding(.horizontal, 16).padding(.vertical, 12)
+            .frame(height: 40)
+            .padding(.horizontal, 6)
 
             ZStack(alignment: .topLeading) {
-                RecorderMemoTextView(text: $store.text, fontSize: store.fontSize, isEditing: store.isEditing)
+                RecorderMemoTextView(text: $store.text, fontSize: store.fontSize)
                 if store.text.isEmpty {
                     Text("写下或粘贴要讲的内容…")
-                        .font(.system(size: store.fontSize)).foregroundStyle(RecorderStyle.muted)
+                        .font(.system(size: store.fontSize)).foregroundStyle(RecorderStyle.faint)
                         .padding(.horizontal, 16).padding(.vertical, 14)
                         .allowsHitTesting(false)
                 }
             }
-            .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(RecorderStyle.line).allowsHitTesting(false) }
-            .padding(.horizontal, 12)
-
-            VStack(spacing: 10) {
-                HStack(spacing: 6) {
-                    fontButton("textformat.size.smaller", title: "缩小备忘录字号", enabled: store.fontSize > 16) {
-                        store.fontSize = max(16, store.fontSize - 2)
-                    }
-                    Text("\(Int(store.fontSize))").font(.appUI(size: 12)).monospacedDigit().frame(width: 24)
-                    fontButton("textformat.size.larger", title: "放大备忘录字号", enabled: store.fontSize < 40) {
-                        store.fontSize = min(40, store.fontSize + 2)
-                    }
-                    Spacer(minLength: 4)
-                    Text("自动保存到本机").font(.appUI(size: 10)).foregroundStyle(RecorderStyle.muted)
-                }
-                HStack(spacing: 9) {
-                    Text("背景不透明度").font(.appUI(size: 11))
-                    Slider(value: $store.opacity, in: 0.55...1)
-                        .tint(RecorderStyle.muted).controlSize(.small)
-                        .accessibilityLabel("备忘录背景不透明度")
-                    Text("\(Int((store.opacity * 100).rounded()))%")
-                        .font(.appUI(size: 11)).monospacedDigit().frame(width: 34, alignment: .trailing)
-                }
-            }
-            .padding(.horizontal, 18).padding(.top, 10).padding(.bottom, 16)
+            .padding(.horizontal, 6).padding(.bottom, 10)
         }
         .foregroundStyle(RecorderStyle.ink)
-        // Only paper fades. Fading the entire NSWindow would also wash out text.
-        .background(LinearGradient(colors: [.white.opacity(store.opacity), RecorderStyle.silver.opacity(store.opacity)],
-            startPoint: .topLeading, endPoint: .bottomTrailing))
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay { RoundedRectangle(cornerRadius: 20).strokeBorder(.white.opacity(0.8)).allowsHitTesting(false) }
+        // Only the sheet fades. Fading the entire NSWindow would also wash out text.
+        .background(RecorderStyle.base.opacity(store.opacity), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(LinearGradient(colors: [RecorderStyle.edgeTop, RecorderStyle.edgeBottom],
+                                             startPoint: .top, endPoint: .bottom), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
         .overlay(alignment: .bottomTrailing) {
-            Image(systemName: "line.3.horizontal.decrease").font(.system(size: 9))
-                .rotationEffect(.degrees(-45)).foregroundStyle(RecorderStyle.muted.opacity(0.65))
-                .frame(width: 16, height: 16)
+            // An invisible corner still resizes; nothing is drawn for it.
+            Color.clear.frame(width: 18, height: 18)
                 .overlay { RecorderMemoWindowHandle(resizes: true) }
-                .padding(3)
         }
         .accessibilityIdentifier("recorder.memo.content")
     }
 
-    private func fontButton(_ symbol: String, title: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+    private func control(_ symbol: String, title: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: symbol).font(.appUI(size: 13)).frame(width: 28, height: 26)
+            Image(systemName: symbol).font(.system(size: symbol.hasPrefix("textformat") ? 15 : 12, weight: .semibold))
+                .foregroundStyle(RecorderStyle.muted)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 30, height: 30)
         }
-        .buttonStyle(RecorderButtonStyle()).disabled(!enabled)
+        .buttonStyle(RecorderCirclePressStyle()).disabled(!enabled).opacity(enabled ? 1 : 0.35)
+        .help(appLocalized(title))
         .accessibilityLabel(appLocalized(title))
-    }
-
-    private func modeButton(editing: Bool, title: String) -> some View {
-        Button {
-            store.isEditing = editing
-            store.save()
-        } label: {
-            Text(appLocalized(title)).font(.appUI(size: 11))
-                .frame(width: 38, height: 27)
-                .background(store.isEditing == editing ? Color.white : .clear,
-                    in: RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(RecorderCirclePressStyle())
-        .accessibilityAddTraits(store.isEditing == editing ? .isSelected : [])
-        .help(editing ? "编辑备忘录" : "切换到阅读，避免误改文稿")
     }
 }
 
 /// NSTextView supplies IME, plain-text paste, native undo and smooth scrolling.
 /// Updating settings never replaces text or selection during marked-text input.
 private struct RecorderMemoTextView: NSViewRepresentable {
+    @Environment(\.locale) private var locale
     @Binding var text: String
     let fontSize: Double
-    let isEditing: Bool
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
     func makeNSView(context: Context) -> NSScrollView {
@@ -341,7 +301,7 @@ private struct RecorderMemoTextView: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
-        let view = NSTextView(frame: .zero)
+        let view = MemoTextView(frame: .zero)
         view.drawsBackground = false
         view.isRichText = false
         view.allowsUndo = true
@@ -355,8 +315,8 @@ private struct RecorderMemoTextView: NSViewRepresentable {
         view.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         view.minSize = .zero
         view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        view.textColor = NSColor(RecorderStyle.ink)
-        view.insertionPointColor = NSColor(RecorderStyle.ink)
+        view.textColor = RecorderStyle.inkNSColor
+        view.insertionPointColor = RecorderStyle.inkNSColor
         view.focusRingType = .none
         view.setAccessibilityLabel(appLocalized("备忘录文稿"))
         view.string = text
@@ -365,9 +325,11 @@ private struct RecorderMemoTextView: NSViewRepresentable {
         return scroll
     }
     func updateNSView(_ scroll: NSScrollView, context: Context) {
+        _ = locale
         context.coordinator.text = $text
         guard let view = scroll.documentView as? NSTextView else { return }
-        view.isEditable = isEditing
+        view.setAccessibilityLabel(appLocalized("备忘录文稿"))
+        view.isEditable = true
         view.isSelectable = true
         if view.string != text, !view.hasMarkedText() { view.string = text }
         if view.font?.pointSize != CGFloat(fontSize) {
@@ -386,6 +348,49 @@ private struct RecorderMemoTextView: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
             text.wrappedValue = view.string
+        }
+    }
+
+    final class MemoTextView: NSTextView {
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        // The recorder hides its editor menu. Keep standard text commands
+        // local to the focused memo instead of relying on those hidden items.
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            guard window?.firstResponder === self, event.type == .keyDown,
+                  let key = event.charactersIgnoringModifiers?.lowercased()
+            else { return super.performKeyEquivalent(with: event) }
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if modifiers == [.command, .shift], key == "z" {
+                if let manager = undoManager, manager.canRedo {
+                    manager.redo()
+                    didChangeText()
+                }
+                return true
+            }
+            guard modifiers == [.command] else { return super.performKeyEquivalent(with: event) }
+            switch key {
+            case "a": selectAll(nil)
+            case "c": copy(nil)
+            case "x": cut(nil)
+            case "v": pasteAsPlainText(nil)
+            case "z":
+                if let manager = undoManager, manager.canUndo {
+                    manager.undo()
+                    didChangeText()
+                }
+            default: return super.performKeyEquivalent(with: event)
+            }
+            return true
+        }
+
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            // Refresh glyph attributes and caret without replacing the text,
+            // selection or IME marked range.
+            textColor = RecorderStyle.inkNSColor
+            insertionPointColor = RecorderStyle.inkNSColor
+            needsDisplay = true
         }
     }
 
